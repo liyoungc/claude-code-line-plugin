@@ -62,6 +62,11 @@ const STATIC = process.env.LINE_ACCESS_MODE === 'static'
 const PORT = Number(process.env.LINE_PORT ?? 8765)
 const TUNNEL_DISABLED = process.env.LINE_TUNNEL === 'off'
 const FIXED_WEBHOOK_URL = process.env.LINE_WEBHOOK_URL // takes precedence over tunnel
+// Path the local HTTP server listens on for LINE webhook POSTs. Default
+// "/webhook" matches the cloudflared quick-tunnel auto-flow. Override when
+// your reverse proxy / tunnel forwards a different path (e.g. Hermes-style
+// "/webhook/line/lynx" routed without rewrite).
+const WEBHOOK_PATH = (process.env.LINE_WEBHOOK_PATH ?? '/webhook').replace(/\/+$/, '') || '/webhook'
 
 if (!TOKEN || !SECRET) {
   process.stderr.write(
@@ -504,7 +509,7 @@ function startHttpServer(port: number): { stop: () => void } {
     async fetch(req) {
       const url = new URL(req.url)
       if (url.pathname === '/health') return new Response('ok')
-      if (url.pathname !== '/webhook') return new Response('not found', { status: 404 })
+      if (url.pathname !== WEBHOOK_PATH) return new Response('not found', { status: 404 })
       if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
 
       const body = await req.text()
@@ -521,7 +526,7 @@ function startHttpServer(port: number): { stop: () => void } {
       return new Response('ok')
     },
   })
-  process.stderr.write(`line channel: webhook listener on http://127.0.0.1:${port}/webhook\n`)
+  process.stderr.write(`line channel: webhook listener on http://127.0.0.1:${port}${WEBHOOK_PATH}\n`)
   return { stop: () => server.stop() }
 }
 
@@ -867,7 +872,7 @@ async function startup(): Promise<void> {
     } else {
       try {
         const tunnel = await startCloudflaredTunnel(PORT)
-        publicUrl = tunnel.endsWith('/webhook') ? tunnel : `${tunnel}/webhook`
+        publicUrl = `${tunnel.replace(/\/+$/, '')}${WEBHOOK_PATH}`
         process.stderr.write(`line channel: cloudflared tunnel up at ${tunnel}\n`)
       } catch (err) {
         process.stderr.write(`line channel: cloudflared failed: ${err}\n`)
