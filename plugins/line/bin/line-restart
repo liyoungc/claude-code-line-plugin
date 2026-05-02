@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# line-restart — kill any LINE plugin server (managed or orphan), so the next
+# /reload-plugins (or next MCP call) gets a clean slate.
+#
+# Use when:
+#   • You upgraded the plugin and the new version's port grab is silently
+#     failing because an older server is still bound.
+#   • Diagnostics show "orphaned/manual" in line-doctor.
+#   • You want to force a webhook re-registration without restarting Claude.
+#
+# This script DOES NOT spawn a new server — Claude Code's plugin host owns
+# server lifecycle. After running this, run /reload-plugins (or just trigger
+# any line MCP tool) to bring it back up under plugin-host management.
+
+set -u
+STATE_DIR="${LINE_STATE_DIR:-$HOME/.claude/channels/line}"
+PIDFILE="$STATE_DIR/server.pid"
+PORT="${LINE_PORT:-8765}"
+
+# Pull LINE_PORT from .env if not exported
+if [[ -r "$STATE_DIR/.env" ]]; then
+  while IFS='=' read -r k v; do
+    [[ "$k" == "LINE_PORT" ]] && PORT="$v"
+  done < "$STATE_DIR/.env"
+fi
+
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+
+# Step 1: TERM the pid in pidfile (the well-behaved path).
+if [[ -r "$PIDFILE" ]]; then
+  pid=$(tr -d '[:space:]' < "$PIDFILE")
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    yellow "▶ TERM pidfile pid=$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      red "▶ KILL pid=$pid (didn't respond to TERM)"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# Step 2: any other claude-code-line-plugin server.ts processes (older versions,
+# manual spawns) — find by command line and TERM them.
+mapfile -t strays < <(pgrep -f 'claude-code-line-plugin.*server\.ts' 2>/dev/null || true)
+if [[ ${#strays[@]} -gt 0 ]]; then
+  yellow "▶ TERM strays: ${strays[*]}"
+  for p in "${strays[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+  sleep 1
+  for p in "${strays[@]}"; do kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true; done
+fi
+
+# Step 3: confirm port is free.
+if lsof -iTCP:"$PORT" -sTCP:LISTEN -P >/dev/null 2>&1; then
+  red "▶ port $PORT still occupied — check 'lsof -iTCP:$PORT -sTCP:LISTEN'"
+  exit 1
+fi
+
+green "▶ ok — port $PORT free, pidfile cleared"
+green "▶ next: /reload-plugins (in Claude Code), or just trigger any line MCP tool"

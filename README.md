@@ -150,6 +150,12 @@ Reply in LINE with `yes <code>` or `no <code>` (5-letter code, no `l`).
 See [ACCESS.md](./ACCESS.md) for full DM policy, group/room enablement,
 mention detection, delivery config, and the `access.json` schema.
 
+## Day-2 operations
+
+For upgrade, restart, and diagnostic flows — including the
+`bin/line-doctor` and `bin/line-restart` helpers — see
+[plugins/line/OPS.md](./plugins/line/OPS.md).
+
 ## Acknowledgements
 
 The architecture and many implementation details follow Anthropic's

@@ -34,11 +34,11 @@ import { messagingApi, validateSignature, type WebhookEvent, type MessageEvent }
 import { randomBytes, createHmac } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync, chmodSync,
+  statSync, renameSync, realpathSync, chmodSync, appendFileSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
-import { spawn, type ChildProcess } from 'child_process'
+import { spawn, spawnSync, type ChildProcess } from 'child_process'
 
 const STATE_DIR = process.env.LINE_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'line')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -46,6 +46,62 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DISCOVERED_FILE = join(STATE_DIR, 'discovered.json')
+const PID_FILE = join(STATE_DIR, 'server.pid')
+const ERR_LOG = join(STATE_DIR, 'server.err.log')
+
+// Persist serious errors (startup failures, port conflicts) somewhere the user
+// can read after the process dies — Claude Code's plugin host swallows stderr
+// of crashed plugin servers, so transient failures become invisible.
+function persistErr(line: string): void {
+  process.stderr.write(line)
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    appendFileSync(ERR_LOG, `[${new Date().toISOString()}] ${line}`, { mode: 0o600 })
+  } catch {}
+}
+
+// Best-effort identification of the process holding a TCP port, for diagnostics
+// only. Uses lsof on Unix-likes; returns null if unavailable.
+function identifyPortOwner(port: number): { pid: number; command: string } | null {
+  try {
+    const out = spawnSync('lsof', ['-iTCP:' + port, '-sTCP:LISTEN', '-P', '-n', '-Fpc'], { encoding: 'utf8' })
+    if (out.status !== 0 || !out.stdout) return null
+    const lines = out.stdout.split('\n')
+    let pid = 0
+    let command = ''
+    for (const l of lines) {
+      if (l.startsWith('p')) pid = Number(l.slice(1))
+      else if (l.startsWith('c')) command = l.slice(1)
+    }
+    return pid ? { pid, command } : null
+  } catch { return null }
+}
+
+function readPidFile(): number | null {
+  try {
+    const raw = readFileSync(PID_FILE, 'utf8').trim()
+    const pid = Number(raw)
+    return Number.isFinite(pid) && pid > 1 ? pid : null
+  } catch { return null }
+}
+
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+
+function writePidFile(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(PID_FILE, String(process.pid) + '\n', { mode: 0o600 })
+  } catch (err) { process.stderr.write(`line: writePidFile failed: ${err}\n`) }
+}
+
+function clearPidFile(): void {
+  try {
+    const raw = readFileSync(PID_FILE, 'utf8').trim()
+    if (Number(raw) === process.pid) rmSync(PID_FILE, { force: true })
+  } catch {}
+}
 
 // Load ~/.claude/channels/line/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where credentials live.
@@ -506,7 +562,26 @@ async function downloadAttachment(messageId: string): Promise<{ path: string; co
 
 // ───────────────────────── webhook URL registration ─────────────────────────
 
+async function getLineWebhookEndpoint(): Promise<string | null> {
+  try {
+    const res = await fetch('https://api.line.me/v2/bot/channel/webhook/endpoint', {
+      headers: { 'Authorization': `Bearer ${TOKEN}` },
+    })
+    if (!res.ok) return null
+    const j = await res.json() as { endpoint?: string }
+    return j.endpoint ?? null
+  } catch { return null }
+}
+
 async function setLineWebhookEndpoint(url: string): Promise<void> {
+  // Skip the PUT (and the LINE API call cost) if already configured to the
+  // same URL. Saves one round-trip per startup and keeps the LINE Developer
+  // Console "Webhook URL last updated" timestamp meaningful.
+  const current = await getLineWebhookEndpoint()
+  if (current === url) {
+    process.stderr.write(`line channel: webhook endpoint already set to ${url} — skipping PUT\n`)
+    return
+  }
   const res = await fetch('https://api.line.me/v2/bot/channel/webhook/endpoint', {
     method: 'PUT',
     headers: {
@@ -575,8 +650,8 @@ function verifyLineSignature(body: string, signature: string | null): boolean {
   }
 }
 
-function startHttpServer(port: number): { stop: () => void } {
-  const server = Bun.serve({
+function buildBunServer(port: number) {
+  return Bun.serve({
     port,
     hostname: '127.0.0.1',
     async fetch(req) {
@@ -588,7 +663,11 @@ function startHttpServer(port: number): { stop: () => void } {
       const body = await req.text()
       const signature = req.headers.get('x-line-signature')
       if (!verifyLineSignature(body, signature)) {
-        process.stderr.write(`line channel: bad signature on inbound\n`)
+        const ua = req.headers.get('user-agent') ?? '?'
+        const len = body.length
+        // Add UA + body size so the operator can tell LINE platform retries
+        // from random scanners — LINE's UA is "LineBotWebhook/2.0".
+        process.stderr.write(`line channel: bad signature on inbound (ua="${ua}" body=${len}B)\n`)
         return new Response('bad signature', { status: 401 })
       }
       let parsed: { events?: WebhookEvent[] }
@@ -599,8 +678,52 @@ function startHttpServer(port: number): { stop: () => void } {
       return new Response('ok')
     },
   })
-  process.stderr.write(`line channel: webhook listener on http://127.0.0.1:${port}${WEBHOOK_PATH}\n`)
-  return { stop: () => server.stop() }
+}
+
+// Start the webhook listener with self-takeover: if the port is already bound
+// by a previous instance of this plugin (recorded in PID_FILE), terminate it
+// and retry. If owned by something else, fail loudly with diagnostics — silent
+// failure here was the v0.0.2 trap that left the user with a stale 0.0.1
+// server holding port 8765 after a /plugin uninstall + reinstall cycle.
+async function startHttpServer(port: number): Promise<{ stop: () => void }> {
+  let server: ReturnType<typeof buildBunServer> | null = null
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      server = buildBunServer(port)
+      break
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? ''
+      const msg = err instanceof Error ? err.message : String(err)
+      if (code !== 'EADDRINUSE' && !/in use|address already/i.test(msg)) {
+        persistErr(`line channel: HTTP listen failed (port ${port}): ${msg}\n`)
+        throw err
+      }
+      const owner = identifyPortOwner(port)
+      const ourPid = readPidFile()
+      const ownerIsOurs = owner && ourPid && owner.pid === ourPid && owner.pid !== process.pid
+      if (attempt === 1 && ownerIsOurs && isAlive(ourPid!)) {
+        persistErr(`line channel: port ${port} held by previous instance PID ${ourPid} — sending SIGTERM\n`)
+        try { process.kill(ourPid!, 'SIGTERM') } catch {}
+        // Give the previous instance up to 3 seconds to release the port.
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 100))
+          if (!isAlive(ourPid!)) break
+        }
+        continue
+      }
+      const ownerStr = owner ? `PID ${owner.pid} (${owner.command})` : 'unknown owner'
+      persistErr(
+        `line channel: cannot bind port ${port} — held by ${ownerStr}, ` +
+        `not recorded in our pidfile (${ourPid ?? 'absent'}).\n` +
+        `  Free the port (kill ${owner?.pid ?? '<pid>'}) or change LINE_PORT in ~/.claude/channels/line/.env\n`,
+      )
+      throw err
+    }
+  }
+  if (!server) throw new Error('startHttpServer: could not bind port')
+  writePidFile()
+  process.stderr.write(`line channel: webhook listener on http://127.0.0.1:${port}${WEBHOOK_PATH} (pid ${process.pid})\n`)
+  return { stop: () => { try { server!.stop() } catch {} ; clearPidFile() } }
 }
 
 // ───────────────────────── approval polling (mirrors discord) ─────────────────────────
@@ -636,7 +759,7 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 // ───────────────────────── MCP server ─────────────────────────
 
 const mcp = new Server(
-  { name: 'line', version: '0.0.2' },
+  { name: 'line', version: '0.0.3' },
   {
     capabilities: {
       tools: {},
@@ -965,7 +1088,7 @@ async function startup(): Promise<void> {
   mkdirSync(INBOX_DIR, { recursive: true })
   await getBotUserId().catch(() => {})
 
-  httpHandle = startHttpServer(PORT)
+  httpHandle = await startHttpServer(PORT)
 
   let publicUrl = FIXED_WEBHOOK_URL
   if (!publicUrl) {

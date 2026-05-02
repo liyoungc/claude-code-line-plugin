@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# line-doctor — one-shot diagnostic for the LINE plugin.
+#
+# Prints, in order:
+#   1. Port-binding state (is the webhook listener up? owned by us?)
+#   2. Local /health probe (is the server actually serving?)
+#   3. Public webhook probe (does Cloudflare/your tunnel route to us?)
+#   4. Recent server log lines (errors, signature failures, discovered groups)
+#   5. Compact access state summary (allowed users, enabled groups, pending pairings, discoveries)
+#
+# Usage: line-doctor          (prints status)
+#        line-doctor --json   (machine-readable)
+#
+# Designed to answer "why isn't my LINE bot replying?" in one screen.
+
+set -u
+STATE_DIR="${LINE_STATE_DIR:-$HOME/.claude/channels/line}"
+ENV_FILE="$STATE_DIR/.env"
+ACCESS="$STATE_DIR/access.json"
+DISCOVERED="$STATE_DIR/discovered.json"
+PIDFILE="$STATE_DIR/server.pid"
+ERR_LOG="$STATE_DIR/server.err.log"
+
+# Pull non-secret env: LINE_PORT, LINE_WEBHOOK_URL, LINE_WEBHOOK_PATH
+if [[ -r "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  set -a; . "$ENV_FILE"; set +a
+fi
+PORT="${LINE_PORT:-8765}"
+PATH_PART="${LINE_WEBHOOK_PATH:-/webhook}"
+PUB="${LINE_WEBHOOK_URL:-}"
+
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m' "$*"; }
+red()   { printf '\033[31m%s\033[0m' "$*"; }
+dim()   { printf '\033[2m%s\033[0m' "$*"; }
+
+bold "▶ port $PORT"
+owner=$(lsof -iTCP:"$PORT" -sTCP:LISTEN -P -n 2>/dev/null | awk 'NR==2 {print $1, $2}')
+if [[ -n "$owner" ]]; then
+  green "  LISTENING"; printf ' by %s\n' "$owner"
+  if [[ -r "$PIDFILE" ]]; then
+    pidf=$(tr -d '[:space:]' < "$PIDFILE")
+    cur=$(awk '{print $2}' <<<"$owner")
+    if [[ "$pidf" == "$cur" ]]; then
+      printf '  pidfile matches owner — '; green 'managed by current plugin'; echo
+    else
+      printf '  pidfile=%s but owner=%s — ' "$pidf" "$cur"; red 'orphaned/manual'; echo
+    fi
+  else
+    printf '  '; dim 'no pidfile (legacy server or pre-startup)'; echo
+  fi
+else
+  red "  NOT LISTENING"; echo
+fi
+
+bold "▶ /health"
+hc=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || echo "---")
+if [[ "$hc" == "200" ]]; then green "  200 OK"; else red "  $hc"; fi; echo
+
+bold "▶ public webhook"
+if [[ -z "$PUB" ]]; then
+  dim "  LINE_WEBHOOK_URL not set — using cloudflared quick tunnel (URL changes per session)"; echo
+else
+  pubc=$(curl -sS -o /dev/null -w '%{http_code} time=%{time_total}s' --max-time 8 \
+    -X POST "$PUB" -H 'content-type: application/json' -d '{"events":[]}' 2>/dev/null || echo "---")
+  case "$pubc" in
+    401*)  green "  401 (signature rejected = path routes correctly to a live server)" ;;
+    200*)  green "  $pubc" ;;
+    404*)  red   "  $pubc — server is up but the path doesn't match LINE_WEBHOOK_PATH" ;;
+    502*|503*|504*) red "  $pubc — tunnel cannot reach localhost:$PORT" ;;
+    *)     red   "  $pubc" ;;
+  esac
+  echo
+  printf '  url: %s\n' "$PUB"
+fi
+
+bold "▶ recent server.err.log"
+if [[ -r "$ERR_LOG" ]]; then
+  tail -n 8 "$ERR_LOG" | sed 's/^/  /'
+else
+  dim "  (none — server hasn't logged any persisted errors)"; echo
+fi
+
+bold "▶ access state"
+if [[ -r "$ACCESS" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '
+      "  dmPolicy: " + .dmPolicy,
+      "  allowFrom: " + (.allowFrom | length | tostring) + " user(s)",
+      "  groups: " + (.groups | length | tostring) + " enabled",
+      "  pending: " + (.pending | length | tostring) + " pairing code(s)"
+    ' "$ACCESS"
+  else
+    sed 's/^/  /' "$ACCESS"
+  fi
+else
+  dim "  (access.json not yet created)"; echo
+fi
+
+if [[ -r "$DISCOVERED" ]]; then
+  bold "▶ discovered (not yet enabled)"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'to_entries[] | "  " + .key + "  (" + (.value.name // "?") + ")  lastSender=" + (.value.lastSender // "?")' "$DISCOVERED"
+  else
+    sed 's/^/  /' "$DISCOVERED"
+  fi
+fi
