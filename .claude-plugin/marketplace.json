@@ -7,8 +7,10 @@
   "plugins": [
     {
       "name": "line",
-      "source": ".",
-      "description": "LINE channel for Claude Code — talk to Claude from a LINE Official Account, with pairing/allowlist access control. Mirrors the official discord plugin."
+      "source": "./plugins/line",
+      "description": "LINE channel for Claude Code — talk to Claude from a LINE Official Account, with pairing/allowlist access control. Mirrors the official discord plugin.",
+      "category": "messaging",
+      "homepage": "https://github.com/liyoungc/claude-code-line-plugin"
     }
   ]
 }
