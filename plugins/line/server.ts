@@ -31,7 +31,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { messagingApi, validateSignature, type WebhookEvent, type MessageEvent } from '@line/bot-sdk'
-import { randomBytes, createHmac } from 'crypto'
+import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, chmodSync, appendFileSync,
@@ -49,13 +49,27 @@ const DISCOVERED_FILE = join(STATE_DIR, 'discovered.json')
 const PID_FILE = join(STATE_DIR, 'server.pid')
 const ERR_LOG = join(STATE_DIR, 'server.err.log')
 
+function ensureStateDir(): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+}
+
+// Atomic JSON write: ensure dir, write to .tmp at 0o600, then rename. Used
+// for both access.json and discovered.json so they can never be observed
+// half-written by an external reader (the /line:access skill).
+function writeAtomicJson(path: string, data: unknown): void {
+  ensureStateDir()
+  const tmp = path + '.tmp'
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, path)
+}
+
 // Persist serious errors (startup failures, port conflicts) somewhere the user
 // can read after the process dies — Claude Code's plugin host swallows stderr
 // of crashed plugin servers, so transient failures become invisible.
 function persistErr(line: string): void {
   process.stderr.write(line)
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    ensureStateDir()
     appendFileSync(ERR_LOG, `[${new Date().toISOString()}] ${line}`, { mode: 0o600 })
   } catch {}
 }
@@ -91,7 +105,7 @@ function isAlive(pid: number): boolean {
 
 function writePidFile(): void {
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    ensureStateDir()
     writeFileSync(PID_FILE, String(process.pid) + '\n', { mode: 0o600 })
   } catch (err) { process.stderr.write(`line: writePidFile failed: ${err}\n`) }
 }
@@ -236,16 +250,26 @@ const BOOT_ACCESS: Access | null = STATIC
     })()
   : null
 
+// Mtime-checked cache: access.json is mutated by the /line:access skill from
+// outside this process, so the cache invalidates on file timestamp change.
+// Without this, every inbound message triggers 3-5 readFileSync + JSON.parse
+// calls (gate, assertOutboundAllowed per tool call, discovery branch, ...).
+let accessCache: { mtimeMs: number; value: Access } | null = null
 function loadAccess(): Access {
-  return BOOT_ACCESS ?? readAccessFile()
+  if (BOOT_ACCESS) return BOOT_ACCESS
+  let mtimeMs: number
+  try { mtimeMs = statSync(ACCESS_FILE).mtimeMs }
+  catch { return readAccessFile() }
+  if (accessCache && accessCache.mtimeMs === mtimeMs) return accessCache.value
+  const value = readAccessFile()
+  accessCache = { mtimeMs, value }
+  return value
 }
 
 function saveAccess(a: Access): void {
   if (STATIC) return
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
+  writeAtomicJson(ACCESS_FILE, a)
+  accessCache = { mtimeMs: statSync(ACCESS_FILE).mtimeMs, value: a }
 }
 
 function pruneExpired(a: Access): boolean {
@@ -279,7 +303,6 @@ function bufferPush(chatId: string, m: BufferedMsg): void {
   if (arr.length > MSG_BUFFER_PER_CHAT) arr.shift()
 }
 
-// Outgoing messages also go in the buffer so fetch_messages shows context.
 function bufferPushOwn(chatId: string, text: string, msgId: string): void {
   bufferPush(chatId, {
     id: msgId,
@@ -317,20 +340,16 @@ function readDiscovered(): Record<string, DiscoveredEntry> {
 
 function writeDiscovered(d: Record<string, DiscoveredEntry>): void {
   if (STATIC) return
-  try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-    const tmp = DISCOVERED_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify(d, null, 2) + '\n', { mode: 0o600 })
-    renameSync(tmp, DISCOVERED_FILE)
-  } catch (err) { process.stderr.write(`line: writeDiscovered failed: ${err}\n`) }
+  try { writeAtomicJson(DISCOVERED_FILE, d) }
+  catch (err) { process.stderr.write(`line: writeDiscovered failed: ${err}\n`) }
 }
 
-async function recordDiscovered(
+function recordDiscovered(
   chatId: string,
   chatType: 'group' | 'room',
   lastSender?: string,
   lastSnippet?: string,
-): Promise<void> {
+): void {
   const d = readDiscovered()
   const now = new Date().toISOString()
   const existing = d[chatId]
@@ -343,9 +362,6 @@ async function recordDiscovered(
     lastSender: lastSender ?? existing?.lastSender,
     lastSnippet: lastSnippet ?? existing?.lastSnippet,
   }
-  if (!entry.name && chatType === 'group') {
-    try { entry.name = (await lineClient.getGroupSummary(chatId)).groupName } catch {}
-  }
   d[chatId] = entry
   writeDiscovered(d)
   process.stderr.write(
@@ -353,6 +369,18 @@ async function recordDiscovered(
     `${entry.name ? ` ("${entry.name}")` : ''}` +
     ` — to enable: /line:access group add ${chatId} [--no-mention] [--dedicated]\n`,
   )
+  // Background the group-name lookup — it's optional, and blocking discovery
+  // on a LINE round-trip just to label the entry adds latency to every
+  // unknown-group inbound.
+  if (!entry.name && chatType === 'group') {
+    lineClient.getGroupSummary(chatId).then(s => {
+      const cur = readDiscovered()
+      if (cur[chatId] && !cur[chatId].name) {
+        cur[chatId].name = s.groupName
+        writeDiscovered(cur)
+      }
+    }).catch(() => {})
+  }
 }
 
 // ───────────────────────── chat-id helpers ─────────────────────────
@@ -365,10 +393,7 @@ function chatIdFromSource(source: WebhookEvent['source']): { chatId: string; typ
 }
 
 function senderIdFromSource(source: WebhookEvent['source']): string | undefined {
-  return source.type === 'user' ? source.userId
-    : source.type === 'group' ? source.userId
-    : source.type === 'room' ? source.userId
-    : undefined
+  return 'userId' in source ? source.userId : undefined
 }
 
 // ───────────────────────── gating ─────────────────────────
@@ -613,28 +638,28 @@ async function startCloudflaredTunnel(localPort: number): Promise<string> {
     let resolved = false
     const re = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 
+    const timer = setTimeout(() => {
+      if (!resolved) { resolved = true; reject(new Error('cloudflared: timed out waiting for URL')) }
+    }, 30_000)
+    const settle = (fn: () => void): void => {
+      if (resolved) return
+      resolved = true
+      clearTimeout(timer)
+      fn()
+    }
+
     const onData = (buf: Buffer): void => {
-      const s = buf.toString()
-      if (!resolved) {
-        const m = s.match(re)
-        if (m) {
-          resolved = true
-          resolve(m[0])
-        }
-      }
+      const m = buf.toString().match(re)
+      if (m) settle(() => resolve(m[0]))
     }
     proc.stdout?.on('data', onData)
     proc.stderr?.on('data', onData)
 
-    proc.on('error', err => { if (!resolved) { resolved = true; reject(err) } })
+    proc.on('error', err => settle(() => reject(err)))
     proc.on('exit', code => {
-      if (!resolved) { resolved = true; reject(new Error(`cloudflared exited (${code})`)) }
+      if (!resolved) settle(() => reject(new Error(`cloudflared exited (${code})`)))
       else process.stderr.write(`line channel: cloudflared exited (${code})\n`)
     })
-
-    setTimeout(() => {
-      if (!resolved) { resolved = true; reject(new Error('cloudflared: timed out waiting for URL')) }
-    }, 30_000)
   })
 }
 
@@ -642,12 +667,7 @@ async function startCloudflaredTunnel(localPort: number): Promise<string> {
 
 function verifyLineSignature(body: string, signature: string | null): boolean {
   if (!signature) return false
-  // @line/bot-sdk's validateSignature is the supported path; this is just a safety net.
-  try { return validateSignature(body, SECRET!, signature) }
-  catch {
-    const expected = createHmac('sha256', SECRET!).update(body).digest('base64')
-    return expected === signature
-  }
+  return validateSignature(body, SECRET!, signature)
 }
 
 function buildBunServer(port: number) {
@@ -683,8 +703,8 @@ function buildBunServer(port: number) {
 // Start the webhook listener with self-takeover: if the port is already bound
 // by a previous instance of this plugin (recorded in PID_FILE), terminate it
 // and retry. If owned by something else, fail loudly with diagnostics — silent
-// failure here was the v0.0.2 trap that left the user with a stale 0.0.1
-// server holding port 8765 after a /plugin uninstall + reinstall cycle.
+// failure here previously left users with a stale server holding the port
+// after a /plugin uninstall + reinstall cycle.
 async function startHttpServer(port: number): Promise<{ stop: () => void }> {
   let server: ReturnType<typeof buildBunServer> | null = null
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -832,7 +852,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute paths to image files to attach. (Note: outbound images need a public HTTPS URL; not yet wired in v0.0.1.)',
+            description: 'Absolute paths to image files to attach. (Note: outbound images need a public HTTPS URL; currently unsupported.)',
           },
         },
         required: ['chat_id', 'text'],
@@ -876,14 +896,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const quote_token = args.quote_token as string | undefined
         const files = (args.files as string[] | undefined) ?? []
         assertOutboundAllowed(chat_id)
-
-        for (const f of files) {
-          assertSendable(f)
-          const st = statSync(f)
-          if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
-          }
-        }
+        // NOTE: file validation skipped until outbound media is implemented —
+        // LINE requires a public HTTPS URL for image messages, so files: are
+        // currently dropped with a notice (see below).
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'newline'
@@ -900,7 +915,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (files.length > 0) {
           // LINE image messages need a public HTTPS URL — without hosting
           // these somewhere reachable by LINE servers we can't attach inline.
-          // v0.0.1 emits a notice so model + user can route around it.
           messages.push({
             type: 'text',
             text: `[note: ${files.length} attachment(s) requested but LINE outbound media requires hosted URLs — not yet implemented in this plugin]`,
@@ -962,7 +976,7 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
   if (ev.type === 'join') {
     const ch = chatIdFromSource(ev.source)
     if (ch && (ch.type === 'group' || ch.type === 'room')) {
-      await recordDiscovered(ch.chatId, ch.type)
+      recordDiscovered(ch.chatId, ch.type)
     }
     return
   }
@@ -974,6 +988,7 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
   const ch = chatIdFromSource(msgEv.source)
   if (!ch) return
   const chat_id = ch.chatId
+  const senderId = senderIdFromSource(msgEv.source) ?? ''
 
   // If this is an unrecognized group/room, log it for discovery before
   // dropping. (gate() already dropped — we just want the user to know.)
@@ -981,9 +996,9 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
     const a = loadAccess()
     if (!a.groups[chat_id]) {
       const m = msgEv.message
-      const senderName = await resolveName(senderIdFromSource(msgEv.source) ?? '', chat_id, ch.type)
+      const senderName = await resolveName(senderId, chat_id, ch.type)
       const snippet = m.type === 'text' ? m.text.slice(0, 80) : `(${m.type})`
-      await recordDiscovered(chat_id, ch.type, senderName, snippet)
+      recordDiscovered(chat_id, ch.type, senderName, snippet)
     }
   }
 
@@ -1030,14 +1045,13 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
     }).catch(() => {})
   }
 
-  // Build content + meta for the MCP notification.
   const m = msgEv.message
   let content = ''
   const meta: Record<string, string> = {
     chat_id,
     message_id: m.id,
     user: result.senderName,
-    user_id: senderIdFromSource(msgEv.source) ?? '',
+    user_id: senderId,
     ts: new Date(msgEv.timestamp).toISOString(),
     chat_type: ch.type,
   }
@@ -1084,7 +1098,7 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
 let httpHandle: { stop: () => void } | null = null
 
 async function startup(): Promise<void> {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  ensureStateDir()
   mkdirSync(INBOX_DIR, { recursive: true })
   await getBotUserId().catch(() => {})
 
