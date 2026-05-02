@@ -43,16 +43,12 @@ with your Claude Code instance acting as a participant.
 
 These are Claude Code commands — run `claude` to start a session first.
 
-If you've added this repo as a marketplace:
+This repo is its own marketplace (it ships a `.claude-plugin/marketplace.json`).
+Register it once, then install:
 
 ```
-/plugin install line@<your-marketplace>
-```
-
-Or install directly from GitHub:
-
-```
-/plugin install line@github:liyoungc/claude-code-line-plugin
+/plugin marketplace add liyoungc/claude-code-line-plugin
+/plugin install line@claude-code-line-plugin
 ```
 
 ### 3. Save credentials
@@ -72,7 +68,7 @@ The MCP server won't connect without this — exit your session and start
 a new one:
 
 ```sh
-claude --channels plugin:line@<your-marketplace>
+claude --channels plugin:line@claude-code-line-plugin
 ```
 
 On startup the server will:

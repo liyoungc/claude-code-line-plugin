@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-line-plugin",
+  "owner": {
+    "name": "Li-yang Chen",
+    "url": "https://github.com/liyoungc"
+  },
+  "plugins": [
+    {
+      "name": "line",
+      "source": ".",
+      "description": "LINE channel for Claude Code — talk to Claude from a LINE Official Account, with pairing/allowlist access control. Mirrors the official discord plugin."
+    }
+  ]
+}
