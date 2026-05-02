@@ -45,6 +45,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const DISCOVERED_FILE = join(STATE_DIR, 'discovered.json')
 
 // Load ~/.claude/channels/line/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where credentials live.
@@ -110,6 +111,13 @@ type GroupPolicy = {
   requireMention: boolean
   /** LINE userIds allowed to trigger the bot in this group/room. Empty = any member. */
   allowFrom: string[]
+  /**
+   * Dedicated-discussion mode: forwarded messages get meta.dedicated = "true",
+   * which (combined with MCP server instructions) tells Claude to engage
+   * every non-ack/emoji message as if directed at it. Only meaningful when
+   * requireMention is false.
+   */
+  dedicated?: boolean
 }
 
 type Access = {
@@ -224,6 +232,71 @@ function bufferPushOwn(chatId: string, text: string, msgId: string): void {
     userId: 'bot',
     text,
   })
+}
+
+// ───────────────────────── discovered groups/rooms ─────────────────────────
+// When Lynx is added to a group/room (or any unknown chat sends a message),
+// log the chat_id here so the user can find it without tailing stderr.
+// /line:access (no args) reads this file and lists pending groups.
+
+type DiscoveredEntry = {
+  chatId: string
+  chatType: 'group' | 'room'
+  firstSeen: string
+  lastSeen: string
+  /** Best-effort group name from getGroupSummary. Optional — not all OAs can resolve it. */
+  name?: string
+  /** Sender display name of last unrecognized message. Helps the user identify which group. */
+  lastSender?: string
+  /** Last message snippet (truncated) for context. */
+  lastSnippet?: string
+}
+
+function readDiscovered(): Record<string, DiscoveredEntry> {
+  try {
+    const raw = readFileSync(DISCOVERED_FILE, 'utf8')
+    return JSON.parse(raw) as Record<string, DiscoveredEntry>
+  } catch { return {} }
+}
+
+function writeDiscovered(d: Record<string, DiscoveredEntry>): void {
+  if (STATIC) return
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = DISCOVERED_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(d, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, DISCOVERED_FILE)
+  } catch (err) { process.stderr.write(`line: writeDiscovered failed: ${err}\n`) }
+}
+
+async function recordDiscovered(
+  chatId: string,
+  chatType: 'group' | 'room',
+  lastSender?: string,
+  lastSnippet?: string,
+): Promise<void> {
+  const d = readDiscovered()
+  const now = new Date().toISOString()
+  const existing = d[chatId]
+  const entry: DiscoveredEntry = {
+    chatId,
+    chatType,
+    firstSeen: existing?.firstSeen ?? now,
+    lastSeen: now,
+    name: existing?.name,
+    lastSender: lastSender ?? existing?.lastSender,
+    lastSnippet: lastSnippet ?? existing?.lastSnippet,
+  }
+  if (!entry.name && chatType === 'group') {
+    try { entry.name = (await lineClient.getGroupSummary(chatId)).groupName } catch {}
+  }
+  d[chatId] = entry
+  writeDiscovered(d)
+  process.stderr.write(
+    `line channel: discovered ${chatType} ${chatId}` +
+    `${entry.name ? ` ("${entry.name}")` : ''}` +
+    ` — to enable: /line:access group add ${chatId} [--no-mention] [--dedicated]\n`,
+  )
 }
 
 // ───────────────────────── chat-id helpers ─────────────────────────
@@ -563,7 +636,7 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 // ───────────────────────── MCP server ─────────────────────────
 
 const mcp = new Server(
-  { name: 'line', version: '0.0.1' },
+  { name: 'line', version: '0.0.2' },
   {
     capabilities: {
       tools: {},
@@ -580,6 +653,8 @@ const mcp = new Server(
       'Messages from LINE arrive as <channel source="line" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use quote_reply (set to a message_id) only when explicitly quoting an earlier message; for normal responses just call reply.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for image attachments. Edits are not supported (LINE doesn\'t allow editing sent messages). Reactions are not supported.',
+      '',
+      "Dedicated-discussion groups: when an inbound has meta.dedicated = \"true\", treat the message as directed at you and respond by calling reply, EXCEPT when the message is purely an emoji/sticker, a one-word ack (\"ok\", \"好\", \"了解\", \"thanks\"), or a side comment between two specific other participants. Use fetch_messages to grab earlier context when a question references previous discussion.",
       '',
       "fetch_messages reads from a local in-process buffer of recent inbound messages — LINE doesn't expose history to bots, so this is best-effort and only spans this session.",
       '',
@@ -757,6 +832,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // ───────────────────────── inbound event handler ─────────────────────────
 
 async function handleEvent(ev: WebhookEvent): Promise<void> {
+  // 'join' fires when Lynx is added to a group/room. We don't have a sender
+  // message yet but we already know the chatId — record it immediately so
+  // the user can pick it up from /line:access without waiting for someone
+  // to type something.
+  if (ev.type === 'join') {
+    const ch = chatIdFromSource(ev.source)
+    if (ch && (ch.type === 'group' || ch.type === 'room')) {
+      await recordDiscovered(ch.chatId, ch.type)
+    }
+    return
+  }
+
   if (ev.type !== 'message') return
   const msgEv = ev as MessageEvent
 
@@ -764,6 +851,18 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
   const ch = chatIdFromSource(msgEv.source)
   if (!ch) return
   const chat_id = ch.chatId
+
+  // If this is an unrecognized group/room, log it for discovery before
+  // dropping. (gate() already dropped — we just want the user to know.)
+  if (result.action === 'drop' && (ch.type === 'group' || ch.type === 'room')) {
+    const a = loadAccess()
+    if (!a.groups[chat_id]) {
+      const m = msgEv.message
+      const senderName = await resolveName(senderIdFromSource(msgEv.source) ?? '', chat_id, ch.type)
+      const snippet = m.type === 'text' ? m.text.slice(0, 80) : `(${m.type})`
+      await recordDiscovered(chat_id, ch.type, senderName, snippet)
+    }
+  }
 
   if (result.action === 'drop') return
 
@@ -818,6 +917,12 @@ async function handleEvent(ev: WebhookEvent): Promise<void> {
     user_id: senderIdFromSource(msgEv.source) ?? '',
     ts: new Date(msgEv.timestamp).toISOString(),
     chat_type: ch.type,
+  }
+  // Dedicated-discussion groups: flag every inbound so Claude treats it
+  // as if directed at it (see MCP server instructions).
+  if ((ch.type === 'group' || ch.type === 'room')) {
+    const policy = access.groups[chat_id]
+    if (policy?.dedicated) meta.dedicated = 'true'
   }
   if (m.type === 'text') {
     content = m.text

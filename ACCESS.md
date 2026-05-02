@@ -56,9 +56,13 @@ LINE has two multi-user contexts:
 - **room** — multi-person chat without a group (`roomId`)
 
 Both are off by default. Opt each one in with the appropriate ID.
-Identifying IDs: invite the bot to the group, post a `@Lynx`-style
-mention, and look at the server stderr log — the `chat_id` in the
-forwarded notification is the groupId/roomId.
+
+**Discovering IDs (v0.0.2+)**: just invite Lynx to the group. The plugin
+captures the `groupId` automatically (from LINE's `join` event, or from
+the first dropped message in the group) and writes it to
+`~/.claude/channels/line/discovered.json`. The next time you run
+`/line:access`, the group appears under "Discovered groups (not enabled
+yet)" with a copy-pasteable enable line.
 
 ```
 /line:access group add C1234567890abcdef1234567890abcdef
@@ -68,12 +72,34 @@ With the default `requireMention: true`, the bot only responds when
 @-mentioned (LINE's structured mention) or matched against
 `mentionPatterns`. Pass `--no-mention` to process every group message.
 Pass `--allow id1,id2` to restrict which group members can trigger it.
+Pass `--dedicated` to mark the group as a Claude-dedicated discussion
+space (see below).
 
 ```
 /line:access group add C1234... --no-mention
+/line:access group add C1234... --no-mention --dedicated
 /line:access group add C1234... --allow U4af...,U5bg...
 /line:access group rm C1234...
 ```
+
+### Dedicated discussion mode (`--dedicated`)
+
+When a group is enabled with `--dedicated` (only meaningful with
+`--no-mention`), every inbound message in that group carries
+`meta.dedicated = "true"`. Combined with the MCP server's instructions,
+this tells Claude to treat every non-ack/non-emoji message as if directed
+at it — turning the group into a "you, your colleagues, and an always-on
+AI participant" space.
+
+Claude is instructed to skip:
+
+- Pure emoji or sticker messages
+- One-word acknowledgments ("ok", "好", "了解", "thanks")
+- Side conversations between two specific other participants
+
+For everything else, Claude calls `reply` and engages with the
+discussion. Use this only in groups where everyone has consented to AI
+participation — every message becomes Claude context.
 
 ## Mention detection
 
@@ -132,8 +158,9 @@ empty lists.
   "allowFrom": ["U4af49806295e..."],
   "groups": {
     "C1234567890abcdef...": {
-      "requireMention": true,
-      "allowFrom": []
+      "requireMention": false,
+      "allowFrom": [],
+      "dedicated": true
     }
   },
   "mentionPatterns": ["^hey lynx\\b"],

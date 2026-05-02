@@ -1,7 +1,7 @@
 {
   "name": "line",
   "description": "LINE channel for Claude Code — talk to Claude from a LINE Official Account, with pairing/allowlist access control. Mirrors the official discord plugin.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "keywords": [
     "line",
     "messaging",

@@ -35,7 +35,11 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<lineUserId>", ...],
   "groups": {
-    "<groupId or roomId>": { "requireMention": true, "allowFrom": [] }
+    "<groupId or roomId>": {
+      "requireMention": true,
+      "allowFrom": [],
+      "dedicated": false   // optional, default false
+    }
   },
   "pending": {
     "<6-char-code>": {
@@ -58,8 +62,19 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### No args — status
 
 1. Read `~/.claude/channels/line/access.json` (handle missing).
-2. Show: dmPolicy, allowFrom count + list, pending count with codes +
-   sender userIds + age, groups count.
+2. Read `~/.claude/channels/line/discovered.json` if it exists. Each entry
+   describes a group/room that Lynx has been added to but is **not yet** in
+   `groups[]` — these are pending discoveries waiting for the user to enable.
+3. Show:
+   - `dmPolicy`
+   - `allowFrom` count + list
+   - Pending pairings (codes + sender userIds + age)
+   - **Enabled groups** with `requireMention` / `dedicated` flags per entry
+   - **Discovered groups (not enabled yet)** — for each:
+     `<chatId>  ("<name>" if known, lastSender: <name>, lastSeen: <iso>)`
+     followed by the copy-pasteable line:
+     `→ /line:access group add <chatId> --no-mention --dedicated`
+4. If at least one discovered group is shown, suggest the user enable one.
 
 ### `pair <code>`
 
@@ -91,10 +106,27 @@ Filter `allowFrom`, write.
 
 Validate mode ∈ `pairing | allowlist | disabled`. Set `dmPolicy`, write.
 
-### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`)
+### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`, `--dedicated`)
 
-`groups[<groupId>] = { requireMention: !hasFlag("--no-mention"), allowFrom: parsedAllowList }`.
+```
+groups[<groupId>] = {
+  requireMention: !hasFlag("--no-mention"),
+  allowFrom: parsedAllowList,
+  dedicated: hasFlag("--dedicated"),
+}
+```
+
 Same shape works for `roomId` (multi-person chats).
+
+After writing, **also remove the entry from `~/.claude/channels/line/discovered.json`**
+if present — that file is just a pending-discovery scratchpad and the group
+is no longer pending once enabled.
+
+**`--dedicated`**: enables "every-message-is-for-Claude" mode. Plugin
+forwards every group message with `meta.dedicated = "true"`, and Claude's
+MCP instructions tell it to engage every non-ack/emoji message. Only
+meaningful with `--no-mention` (with mention required, dedicated has no
+extra effect since mentioned messages already get full attention).
 
 ### `group rm <groupId>`
 
@@ -114,9 +146,11 @@ LINE userIds are 33-char strings (e.g. `U4af4980629...`). The bot can only
 see them when a user actually sends it a message — there's no "right-click
 copy ID" like Discord. Hence pairing is the primary way to capture them.
 
-For groups/rooms: invite the bot to the group, send a `@Lynx` mention, and
-read the `groupId` / `roomId` printed in the server log (or use
-`fetch_messages` after enabling group access without `--no-mention`).
+**For groups/rooms** (easy way, v0.0.2+): invite Lynx to the group. The
+plugin captures the `groupId` automatically — either from the LINE `join`
+event, or from the first message in the group (even though that message is
+dropped by the gate). The id lands in `~/.claude/channels/line/discovered.json`
+and shows up the next time you run `/line:access`.
 
 ## Implementation notes
 
